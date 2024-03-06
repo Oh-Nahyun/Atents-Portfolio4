@@ -1,0 +1,392 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using Unity.VisualScripting;
+using UnityEngine;
+using UnityEngine.InputSystem;
+
+public class Player : MonoBehaviour
+{
+    /// <summary>
+    /// 이동 속도
+    /// </summary>
+    public float speed = 3.0f;
+
+    /// <summary>
+    /// 현재 이동 속도
+    /// </summary>
+    float currentSpeed = 3.0f;
+
+    /// <summary>
+    /// 현재 입력된 이동 방향
+    /// </summary>
+    Vector2 inputDirection = Vector2.zero;
+
+    /// <summary>
+    /// 지금 움직이고 있는지 확인하는 변수 (true면 움직인다.)
+    /// </summary>
+    bool isMove = false;
+
+    /// <summary>
+    /// 공격 쿨타임
+    /// </summary>
+    public float attackCoolTime = 1.0f;
+
+    /// <summary>
+    /// 현재 남아있는 공격 쿨타임
+    /// </summary>
+    float currentAttackCoolTime = 0.0f;
+
+    /// <summary>
+    /// 공격 쿨타임이 다 되었는지 확인하기 위한 프로퍼티
+    /// </summary>
+    bool IsAttackReady => currentAttackCoolTime < 0.0f;
+
+    /// <summary>
+    /// AttackSecsor의 회전축
+    /// </summary>
+    Transform attackSensorAxis;
+
+    /// <summary>
+    /// 현재 플레이어의 공격 범위 안에 들어있는 적의 목록
+    /// </summary>
+    List<Slime> attackTargetList;
+
+    /// <summary>
+    /// 지금 공격이 유효한 상태인지 확인하는 변수
+    /// </summary>
+    bool isAttackValid = false;
+
+    // 컴포넌트들
+    Rigidbody2D rigid;
+    Animator animator;
+
+    // 인풋액션
+    PlayerInputActions inputActions;
+
+    // 애니메이터용 해시값들
+    readonly int InputX_Hash = Animator.StringToHash("InputX");
+    readonly int InputY_Hash = Animator.StringToHash("InputY");
+    readonly int IsMove_Hash = Animator.StringToHash("IsMove");
+    readonly int Attack_Hash = Animator.StringToHash("Attack");
+
+    /// <summary>
+    /// 플레이어가 현재 위치하고 있는 맵의 그리드
+    /// </summary>
+    Vector2Int currentMap;
+
+    /// <summary>
+    /// CurrentMap에 값을 설정할 때 변경이 있었으면 델리게이트를 실행해서 알리는 프로퍼티
+    /// </summary>
+    Vector2Int CurrentMap
+    {
+        get => currentMap;
+        set
+        {
+            if (value != currentMap)
+            {
+                currentMap = value;
+                onMapChange?.Invoke(currentMap); // 맵 변경을 알림
+            }
+        }
+    }
+
+    /// <summary>
+    /// 플레이어가 있는 맵이 변경되면 실행되는 델리게이트
+    /// </summary>
+    public Action<Vector2Int> onMapChange;
+
+    /// <summary>
+    /// 월드 매니저
+    /// </summary>
+    WorldManager world;
+
+    /// <summary>
+    /// 플레이어의 최대 수명
+    /// </summary>
+    public float maxLifeTime = 10.0f;
+
+    /// <summary>
+    /// 플레이어의 현재 수명
+    /// </summary>
+    float lifeTime;
+
+    /// <summary>
+    /// 수명을 확인하고 변경되었을 때의 처리를 하는 프로퍼티
+    /// </summary>
+    float LifeTime
+    {
+        get => lifeTime;
+        set
+        {
+            lifeTime = value; // 값을 설정
+
+            if (isAlive && lifeTime < 0.0f) // 살아있는데 수명이 0 미만이면 사망
+            {
+                Die();
+            }
+            else
+            {
+                // 살아있으면 일반 처리
+                lifeTime = Mathf.Clamp(lifeTime, 0.0f, maxLifeTime); // 일정 범위를 벗어나지 않게 만들기
+                onLifeTimeChange?.Invoke(lifeTime / maxLifeTime); // 수명이 변경되었음을 알림
+            }
+        }
+    }
+
+    /// <summary>
+    /// 전체 플레이 시간
+    /// </summary>
+    float totalPlayTime = 0.0f;
+
+    /// 실습_240305
+    /// 1. 시작하면 플레이어의 수명이 최대 수명으로 변경
+    /// 2. 시간이 지날수록 플레이어의 수명이 감소 (초당 1)
+    /// 3. 플레이어의 수명 변화가 LifeTimeGauge UI에 반영되어야 한다.
+
+    /// <summary>
+    /// 플레이어의 수명이 변경되었을 때 실행될 델리게이트 (float : 수명의 비율)
+    /// </summary>
+    public Action<float> onLifeTimeChange;
+
+    /// <summary>
+    /// 플레이어가 죽었음을 알리는 델리게이트 (float : 전체 플레이 시간, int : 킬카운트)
+    /// </summary>
+    public Action<float, int> onDie;
+
+    /// <summary>
+    /// 살았는지 표시하는 변수
+    /// </summary>
+    bool isAlive = true;
+
+    /// <summary>
+    /// 잡은 슬라임 수
+    /// </summary>
+    int killCount = -1;
+
+    int KillCount
+    {
+        get => killCount;
+        set
+        {
+            if (killCount != value)
+            {
+                killCount = value;
+                onKillCountChange?.Invoke(killCount);
+            }
+        } 
+    }
+
+    public Action<int> onKillCountChange ;
+
+    private void Awake()
+    {
+        rigid = GetComponent<Rigidbody2D>();
+        animator = GetComponent<Animator>();
+        inputActions = new PlayerInputActions();
+
+        currentSpeed = speed;
+
+        attackSensorAxis = transform.GetChild(0);
+
+        attackTargetList = new List<Slime>(4);
+        AttackSensor sensor = attackSensorAxis.GetComponentInChildren<AttackSensor>();
+        sensor.onEnemyEnter += (slime) => // 적이 센서 안에 들어오면
+        {
+            if (isAttackValid)
+            {
+                // 공격이 유효한 상황이면
+                slime.Die(); // 즉시 죽이기
+            }
+            else
+            {
+                // 공격이 유효하지 않으면
+                attackTargetList.Add(slime); // 리스트에 추가하고
+            }
+            slime.ShowOutline(); // 아웃라인을 그린다.
+        };
+        sensor.onEnemyExit += (slime) => // 적이 센서에서 나가면
+        {
+            attackTargetList.Remove(slime); // 리스트에서 제거하고
+            slime.ShowOutline(false); // 아웃라인을 끈다.
+        };
+    }
+
+    private void OnEnable()
+    {
+        inputActions.Player.Enable();
+        inputActions.Player.Move.performed += OnMove;
+        inputActions.Player.Move.canceled += OnStop;
+        inputActions.Player.Attack.performed += OnAttack;
+    }
+
+    private void OnDisable()
+    {
+        inputActions.Player.Attack.performed -= OnAttack;
+        inputActions.Player.Move.canceled -= OnStop;
+        inputActions.Player.Move.performed -= OnMove;
+        inputActions.Player.Disable();
+    }
+
+    private void Start()
+    {
+        world = GameManager.Instance.World;
+        LifeTime = maxLifeTime;
+        KillCount = 0;
+    }
+
+    private void Update()
+    {
+        currentAttackCoolTime -= Time.deltaTime;
+        LifeTime -= Time.deltaTime;
+        totalPlayTime += Time.deltaTime;
+    }
+
+    private void FixedUpdate()
+    {
+        // 물리 프레임마다 inputDirection 방향으로 초당 currentSpeed만큼 이동
+        rigid.MovePosition(rigid.position + Time.fixedDeltaTime * currentSpeed * inputDirection);
+
+        CurrentMap = world.WorldToGrid(rigid.position); // 플레이어가 있는 맵 설정
+    }
+
+    private void OnMove(InputAction.CallbackContext context)
+    {
+        // 입력값 받아와서
+        inputDirection = context.ReadValue<Vector2>();
+
+        // 애니메이션 조정
+        animator.SetFloat(InputX_Hash, inputDirection.x);
+        animator.SetFloat(InputY_Hash, inputDirection.y);
+        isMove = true;
+        animator.SetBool(IsMove_Hash, isMove);
+
+        // 공격 범위 회전시키기
+        AttackSensorRotate(inputDirection);
+    }
+
+    private void OnStop(InputAction.CallbackContext _)
+    {
+        // 이동 방향을 0으로 만들고
+        inputDirection = Vector2.zero;
+
+        // InputX와 InputY를 변경하지 않는 이유
+        // Idle 애니메이션을 마지막 이동 방향으로 재생하기 위해
+
+        isMove = false; // 정지
+        animator.SetBool(IsMove_Hash, isMove);
+    }
+
+    private void OnAttack(InputAction.CallbackContext _)
+    {
+        if (IsAttackReady) // 공격 쿨타임이 다 되었으면
+        {
+            animator.SetTrigger(Attack_Hash); // 애니메이션 재생
+            currentAttackCoolTime = attackCoolTime; // 쿨타임 초기화
+            currentSpeed = 0.0f; // 이동 정지
+            isAttackValid = false; // 만약을 대비한 초기화 (isAttackValid가 true로 고정되는 일 방지)
+        }
+    }
+
+    /// <summary>
+    /// 이동 속도를 원래대로 되돌리는 함수
+    /// </summary>
+    public void RestoreSpeed()
+    {
+        currentSpeed = speed;
+    }
+
+    /// <summary>
+    /// 입력 방향에 따라 AttackSensor를 회전 시키는 함수
+    /// </summary>
+    /// <param name="direction">입력 방향</param>
+    void AttackSensorRotate(Vector2 direction)
+    {
+        // 대각선은 위아래를 우선(시 한다.)
+        if (direction.y < 0)
+        {
+            attackSensorAxis.rotation = Quaternion.identity; // 아래
+        }
+        else if (direction.y > 0)
+        {
+            attackSensorAxis.rotation = Quaternion.Euler(0, 0, 180); // 위
+        }
+        else if (direction.x < 0)
+        {
+            attackSensorAxis.rotation = Quaternion.Euler(0, 0, -90); // 왼쪽
+        }
+        else if (direction.x > 0)
+        {
+            attackSensorAxis.rotation = Quaternion.Euler(0, 0, 90); // 오른쪽
+        }
+        else
+        {
+            attackSensorAxis.rotation = Quaternion.identity; // 입력이 없음 (0, 0)
+        }
+    }
+
+    /// <summary>
+    /// 공격 애니메이션 진행 중에 공격이 유효해지면 애니메이션 이벤트로 실행
+    /// </summary>
+    void AttackValid()
+    {
+        isAttackValid = true;
+        foreach (var slime in attackTargetList)
+        {
+            slime.Die();
+        }
+        attackTargetList.Clear();
+        //Debug.Log("공격이 유효");
+    }
+
+    /// <summary>
+    /// 공격 애니메이션 진행 중에 공격이 유효하지 않게 되면 애니메이션 이벤트로 실행
+    /// </summary>
+    void AttackNotValid()
+    {
+        isAttackValid = false;
+        //Debug.Log("공격이 마무리");
+    }
+
+    /// <summary>
+    /// 몬스터를 잡았을 때 실행할 함수
+    /// </summary>
+    /// <param name="bonus">몬스터 처리 보너스 (수명 추가)</param>
+    public void MonsterKill(float bonus)
+    {
+        LifeTime += bonus;
+        KillCount++;
+    }
+
+    /// <summary>
+    /// 플레이어가 죽었을 때 처리할 일을 처리하는 함수
+    /// </summary>
+    void Die()
+    {
+        isAlive = false;                            // 죽었다고 표시
+        lifeTime = 0.0f;                            // 수명을 0으로 정리
+        onLifeTimeChange?.Invoke(0);                // 수명 변화를 알리기
+        inputActions.Player.Disable();              // 플레이어 입력 정지
+        onDie?.Invoke(totalPlayTime, KillCount);    // 사망 알리기
+    }
+
+#if UNITY_EDITOR
+    public void TestDie()
+    {
+        Die();
+    }
+#endif
+}
+
+/// 실습_240219
+/// 1. 입력처리
+///     1.1. Player Input Action 맵 만들기
+/// 2. Move 애니메이션 만들기
+///     2.1. 10 프레임 간격으로 0~3번
+/// 3. Move Blend Tree 만들기
+
+/// 실습_240220
+/// 플레이어가 공격하기
+/// - 애니메이션만 재생
+/// - 공격은 쿨타임이 있다. (1초)
+/// - 이동 중 공격을 하면 공격 애니메이션 중에는 멈추고 애니메이션이 끝나면 다시 이동한다.
